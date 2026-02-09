@@ -5,7 +5,6 @@ namespace Lshape_route {
 //declaration
 void Lshape_route(vector<int> &nets2route);
 
-//implementation
 
 __global__ void Lshape_route_cuda(int net_cnt, int net_offset, int *node_cnt_sum, int *nodes, int *par_nodes, double *dist, int *from, int *layer_range, int stamp) {
     int net_idx = blockIdx.x * blockDim.x + threadIdx.x;// net_idx-th net in this batch
@@ -156,11 +155,11 @@ __global__ void Lshape_route_cuda(int net_cnt, int net_offset, int *node_cnt_sum
 void Lshape_route(vector<int> &nets2route) {
     double Lshape_start_time = elapsed_time();
 
-
     if(LOG) printf("[%5.1f] FLUTE", elapsed_time()); cerr << endl;
     #pragma omp parallel for num_threads(8)
     for(int i = 0; i < nets2route.size(); i++) {
-        nets[nets2route[i]].construct_rsmt();
+        bool log_flag = false;
+        nets[nets2route[i]].construct_rsmt(log_flag);
     }
     if(LOG) printf("[%5.1f] FLUTE END", elapsed_time()); cerr << endl;
 
@@ -172,8 +171,8 @@ void Lshape_route(vector<int> &nets2route) {
         return nets[l].hpwl > nets[r].hpwl;
     });
     if(LOG) printf("[%5.1f] SORT END\n", elapsed_time());
-    
-    auto batches = generate_batches_rsmt(nets2route);
+
+    auto batches = generate_batches_rsmt_gpu(nets2route);
     reverse(batches.begin(), batches.end());
 
     vector<int> batch_cnt_sum(batches.size() + 1, 0);
@@ -192,14 +191,20 @@ void Lshape_route(vector<int> &nets2route) {
     if(LOG) printf("[%5.1f] DFS\n", elapsed_time());
     for(int id = 0; id < net_cnt; id++) {
         auto &graph = nets[nets2route[id]].rsmt;
+        node_cnt_sum_cpu[id + 1] = node_cnt_sum_cpu[id] + graph.back().size();
+    }
+    #pragma omp parallel for num_threads(8)
+    for(int id = 0; id < net_cnt; id++) {
+        auto &graph = nets[nets2route[id]].rsmt;
+        int node_idx_cnt = 0;
         function<void(int, int, int)> dfs = [&] (int x, int par, int par_node_idx) {
-            int node_idx = node_cnt_sum_cpu[id + 1]++;
+            int node_idx = node_idx_cnt++;
             nodes_cpu[node_cnt_sum_cpu[id] + node_idx] = graph.back()[x];
             par_nodes_cpu[node_cnt_sum_cpu[id] + node_idx] = par_node_idx;
             for(auto e : graph[x]) if(e != par) dfs(e, x, node_idx);
         };
         dfs(0, -1, -1);
-        node_cnt_sum_cpu[id + 1] += node_cnt_sum_cpu[id];
+        assert((node_cnt_sum_cpu[id + 1] - node_cnt_sum_cpu[id]) == graph.back().size());
     }
     if(LOG) printf("[%5.1f] DFS END\n", elapsed_time());
     int max_num_nodes = 0;

@@ -21,7 +21,60 @@ int *macroBorder_cpu;
 int cntCongested = 0;
 int totalEdgeNum = 0;
 
+__global__ void distinguish_macroBorder()
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index>=X*Y) return;
+    int x = index/Y;
+    int y = index%Y;
+    int l = 1;
+    if(capacity[IDX(l, x, y)]==0) return;
+    bool isBorder = 0;
+    if(x+1<X-1 && capacity[IDX(l, x+1, y)]==0)
+    {
+        isBorder=1;
+    }
+    if(x>2 && capacity[IDX(l, x-1, y)]==0)
+    {
+        isBorder=1;
+    }
+    if(y+1<Y-1 && capacity[IDX(l, x, y+1)]==0)
+    {
+        isBorder=1;
+    }
+    if(y>2 && capacity[IDX(l, x, y-1)]==0)
+    {
+        isBorder=1;
+    }
+    // printf("%d, %d is a border\n", x, y);
+    macroBorder[index] = isBorder;
+}
+
+__global__ void distinguish_macroBorder_direction()
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index>=X*Y) return;
+    int x = index/Y;
+    int y = index%Y;
+    // int l = 1;
+    // macroBorder[index] = true;
+    if(macroBorder[index]==0) return;
+    if(x>1&&macroBorder[(x-1)*Y+y]>0)
+    {
+        macroBorder[(x-1)*Y+y]++;
+    }
+    if(x<X-2&&macroBorder[(x+1)*Y+y]==1)
+    {
+        macroBorder[(x+1)*Y+y]++;
+    }
+    // 1: vertical, bigger than 1: horizontal
+}
+
+std::chrono::high_resolution_clock::time_point start, end, start_total, end_total;
+std::chrono::duration<double> time1, time2, time3, time4, time5, time6, time7, time8, time9, time10, time_update_cost;
+
 __managed__ int *node_cnt_sum, *nodes, *par_nodes, *from, *layer_range;
+////////////////////////////////////////////////////////////////////
 int node_cnt_estimate;
 int parent_cnt_estimate;
 __managed__ int *child_num; 
@@ -36,7 +89,7 @@ __managed__ double *childCosts;
 __managed__ int *childCosts_road;
 __managed__ unsigned long long *packed_information;
 
-__managed__ unsigned long long *best_path;
+__managed__ int *best_path;
 
 __managed__ int *layer_output;
 __managed__ double *costs;
@@ -63,6 +116,7 @@ int *node_cnt_sum_cpu, *node_depth_cpu, *net_depth_cpu, *batch_depth_cnt_cpu, *d
 __device__ void atomicMinDouble(double *address, double val) {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
     unsigned long long int old = *address_as_ull, assumed;
+
     do {
         assumed = old;
         if (__longlong_as_double(assumed) <= val) {
@@ -71,6 +125,24 @@ __device__ void atomicMinDouble(double *address, double val) {
         old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
     } while (assumed != old);
 }
+
+// __device__ void atomicMinCostAndPath(double *address, int *road, double new_cost, int new_road) {
+//     unsigned long long *address_as_ull = (unsigned long long *)address;
+//     unsigned long long old = *address_as_ull, assumed;
+
+//     do {
+//         assumed = old;
+//         double old_cost = __longlong_as_double(assumed);
+//         if (new_cost < old_cost || (new_cost == old_cost && new_road < road[0])) {
+//             old = atomicCAS(address_as_ull, assumed, __double_as_longlong(new_cost));
+//             if (old_cost == new_cost && new_road < road[0]) {
+//                 road[0] = new_road;
+//             }
+//         } else {
+//             break;
+//         }
+//     } while (assumed != old);
+// }
 
 __global__ void init_min_child_costs(int limit) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -103,6 +175,8 @@ __device__ void unpackCostAndNodeId(unsigned long long packed, double* cost, int
     *node_id = (int)(packed & ((1ULL << COST_SHIFT) - 1));
 }
 
+// __device__ const unsigned long long init_cost_with_road = 0x65a9681600bebc200ULL;
+
 __device__ const unsigned long long init_cost_with_road = 7208259049189261824;
 
 __global__ void init_road(int limit) {
@@ -117,17 +191,19 @@ __global__ void init_costs(int limit) {
     {
         return;
     }
+    // int node_id = blockIdx.x;
     costs[index] = INF;
 }
 
 __global__ void precompute_cost_edge(int par_sum)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int edge_id = index / 9;
+    // if(index>= edge_cnt * 9) return;
+    int edge_id = index/9;
     if(edge_id>=par_sum) return;
     int target_node_idx = par_nodes[edge_id];
     int from_layer = index%9;
-    int from_node_idx = currentChildIDX[edge_id] / 10;
+    int from_node_idx = currentChildIDX[edge_id]/10;
     int tox = nodes[target_node_idx] / Y % X, toy = nodes[target_node_idx] % Y;
     int fromx = nodes[from_node_idx] / Y % X, fromy = nodes[from_node_idx] % Y;
     if(((from_layer & 1 ^ DIR) == 0 && fromy != toy)||((from_layer & 1 ^ DIR) == 1 && fromx != tox))
@@ -136,20 +212,26 @@ __global__ void precompute_cost_edge(int par_sum)
         cost_edges[edge_id * 81 + from_layer * 9 + to_layer] = INF;
         return;
     }
-    assert(fromx == tox || fromy == toy);
-    int distance = abs(tox - fromx) + abs(toy - fromy);
+    assert(fromx==tox||fromy==toy);
+    int distance = abs(tox-fromx)+abs(toy-fromy);
     if(distance==0) return;
-    int dd=distance / min(distance, 20);
-    bool isVertical = (fromx == tox);
+    int dd=distance/min(distance, 20);
+    bool isVertical = (fromx==tox);
     int start_search_pos = isVertical?min(fromy, toy):min(fromx, tox);
     int end_search_pos = isVertical?max(fromy, toy):max(fromx, tox);
     for(int to_layer = 0; to_layer < 9; to_layer++)
     {
         if((to_layer%2)!=(from_layer%2)) continue;
         double min_costt = INF;
+        // int decide_x = -1;
+        // int decide_y = -1;
         int decide_pos = -1;
-        assert(start_search_pos >= 0);
-        assert(end_search_pos >= 0);
+        assert(start_search_pos>=0);
+        assert(end_search_pos>=0);
+        if(dd<0)
+        {
+            printf("distance = %d\n", distance);
+        }
         assert(dd>0);
         for(int search_pos = start_search_pos+dd; ; search_pos+=dd)
         {
@@ -169,6 +251,11 @@ __global__ void precompute_cost_edge(int par_sum)
             }
             assert(search_x>=0);
             assert(search_y>=0);
+            // double via_cost_tmp = unit_via_cost;
+            // for(int ll = min(from_layer, to_layer) + 1; ll < max(from_layer, to_layer); ll++)
+            // {
+            //     via_cost_tmp += vcost[IDX(ll, search_x, search_y)];
+            // }
             double via_cost_tmp = 0;
             for(int ll = min(from_layer, to_layer); ll < max(from_layer, to_layer); ll++)
             {
@@ -183,15 +270,60 @@ __global__ void precompute_cost_edge(int par_sum)
                 cost_tmp += (graph::wire_segment_cost(from_layer, min(fromx, search_x), max(fromx, search_x), fromy, fromy)
                             + graph::wire_segment_cost(to_layer, min(tox, search_x), max(tox, search_x), toy, toy));
             }
+        //     //  + graph::wire_segment_cost(from_layer, fromx, fromx, min(y, search_y), max(y, search_y))
+        //     //                 + graph::wire_segment_cost(to_layer, x, x, min(py, search_y), max(py, search_y));
             if(cost_tmp < min_costt)
             {
                 min_costt = cost_tmp;
+                // decide_x = search_x;
+                // decide_y = search_y;
                 decide_pos = search_pos;
             }
         }
+        // printf("%d, %d, %f\n", par_sum, edge_id * 81 + from_layer * 9 + to_layer, min_costt);
+        // cost_edges[edge_id * 81 + from_layer * 9 + to_layer] = min_costt;
+        // assert(edge_id < 20740);
+        // assert(decide_pos>=0);
         cost_edges[edge_id * 81 + from_layer * 9 + to_layer] = min_costt;
+        // cost_edges[edge_id * 81 + from_layer * 9 + to_layer] = 1000000;
+        // best_change[edge_id * 81 + from_layer * 9 + to_layer] = decide_x*Y+decide_y;
         best_change[edge_id * 81 + from_layer * 9 + to_layer] = decide_pos;
     }
+}
+
+void saveCongestion(const char file_name1[], const char file_name2[], const char file_name3[]) {
+    if(LOG) printf("[%5.1f] -- Output Congestion View starts\n", elapsed_time());
+    FILE *file = fopen(file_name1, "w");
+    for(int y = 0; y < Y; y++)
+    {
+        for(int x = 0; x < X; x++)
+        {
+            fprintf(file, "%d ", congestionView_cpu[x*Y+y]);
+        }
+        fprintf(file, "\n");
+    }
+    fclose(file);
+
+    file = fopen(file_name2, "w");
+    for(int y = 0; y < Y; y++)
+    {
+        for(int x = 0; x < X; x++)
+        {
+            fprintf(file, "%f ", congestionView_xsum_cpu[x*Y+y]);
+        }
+        fprintf(file, "\n");
+    }
+
+    file = fopen(file_name3, "w");
+    for(int y = 0; y < Y; y++)
+    {
+        for(int x = 0; x < X; x++)
+        {
+            fprintf(file, "%f ", congestionView_ysum_cpu[x*Y+y]);
+        }
+        fprintf(file, "\n");
+    }
+    if(LOG) printf("[%5.1f] -- Output Congestion View end\n", elapsed_time());
 }
 
 __global__ void Lshape_route_node_cuda(int shift, int end_shift) {
@@ -207,32 +339,194 @@ __global__ void Lshape_route_node_cuda(int shift, int end_shift) {
     int fixed_layer_high = fixed_layer_low==10?0:fixed_layer_low;
     int cur_child_num = child_num_sum[node_idx+1]-child_num_sum[node_idx];
 
-    unsigned long long *cur_best_path = best_path + child_num_sum[node_idx] * MAX_LAYER;
+    int *cur_best_path = best_path + child_num_sum[node_idx] * MAX_LAYER;
+    double *cur_childCosts = childCosts + child_num_sum[node_idx] * MAX_LAYER;
+    int *cur_childCosts_road = childCosts_road + child_num_sum[node_idx] * MAX_LAYER;
+    // unsigned long long *cur_packed_information = packed_information + child_num_sum[node_idx] * MAX_LAYER;
+    double minChildCosts[6];
+    int bestPaths[6];
+    for (int lowLayerIndex = MIN_ROUTE_LAYER; lowLayerIndex <= fixed_layer_low; lowLayerIndex++) {
+        for(int cid=0; cid<cur_child_num; cid++)
+        {
+            minChildCosts[cid] = INF;
+            // bestPaths[cid] = 0;
+        }
+        double via_cost = 0;
+        // int original_min = lowLayerIndex;
+        for (int layerIndex = lowLayerIndex; layerIndex < (L+1); layerIndex++) {
+            if(layerIndex>lowLayerIndex)
+            {   
+                // min value of lowLayerIndex is 1 
+                via_cost += vcost[IDX(layerIndex - 2, x, y)];
+            }
+            // int min_layer = 10;
+            for (int childIndex = 0; childIndex < cur_child_num; childIndex++) {
+                double cost;
+                int nodeddd;
+                // unpackCostAndNodeId(cur_packed_information[childIndex * MAX_LAYER + layerIndex], &cost, &nodeddd);
+                double cur_child_cost = cur_childCosts[childIndex * MAX_LAYER + layerIndex];
+                // cur_child_cost = cost;
+                if (cur_child_cost < minChildCosts[childIndex]) {
+                    minChildCosts[childIndex] = cur_child_cost;
+                    bestPaths[childIndex] = cur_childCosts_road[childIndex * MAX_LAYER + layerIndex] * MAX_LAYER + layerIndex;
+                    // bestPaths[childIndex] = nodeddd * MAX_LAYER + layerIndex;
+                }
+                // min_layer = min(min_layer, bestPaths[childIndex] % MAX_LAYER);
+            }
+            // if(min_layer>lowLayerIndex && lowLayerIndex < fixed_layer_low)
+            // {
+            //     via_cost -= vcost[IDX(lowLayerIndex - 1, x, y)];
+            //     lowLayerIndex++;
+            // }
+            if (layerIndex >= fixed_layer_high) {
+                double cost = via_cost;
+                for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
+                {
+                    cost += minChildCosts[childIndex];
+                }
+                if (cost<INF && cost < costs[node_idx*MAX_LAYER+layerIndex]) {
+                    costs[node_idx*MAX_LAYER+layerIndex] = cost;
+                    for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
+                    {
+                        cur_best_path[childIndex * MAX_LAYER + layerIndex] = bestPaths[childIndex];
+                    }
+                }
+            }
+        }
+        for (int layerIndex = (L+1) - 2; layerIndex >= lowLayerIndex; layerIndex--) {//
+            if (costs[node_idx*MAX_LAYER+layerIndex + 1] < costs[node_idx*MAX_LAYER+layerIndex]) {
+                costs[node_idx*MAX_LAYER+layerIndex] = costs[node_idx*MAX_LAYER+layerIndex + 1];
+                for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
+                {
+                    cur_best_path[childIndex * MAX_LAYER + layerIndex] = cur_best_path[childIndex * MAX_LAYER + layerIndex+1];
+                }
+            }
+        }
+        // for (int layerIndex = lowLayerIndex - 1; layerIndex >= original_min; layerIndex--) {
+        //     if (costs[node_idx*MAX_LAYER+layerIndex + 1] + vcost[IDX(layerIndex - 1, x, y)]< costs[node_idx*MAX_LAYER+layerIndex] ) {
+        //         costs[node_idx*MAX_LAYER+layerIndex] = costs[node_idx*MAX_LAYER+layerIndex + 1] + vcost[IDX(layerIndex - 1, x, y)];
+        //         for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
+        //         {
+        //             cur_best_path[childIndex * MAX_LAYER + layerIndex] = cur_best_path[childIndex * MAX_LAYER + layerIndex+1];
+        //         }
+        //     }
+        // }
+    }
+    int node_x = nodes[node_idx] / Y % X, node_y = nodes[node_idx] % Y; 
+
+    for(int par_id = 0; par_id < parent_num_cur; par_id++)
+    {
+        int parent_IDX = par_nodes[par_num_sum[node_idx] + par_id];
+        int child_index_of_current_node = currentChildIDX[par_num_sum[node_idx] + par_id]%10;
+        // printf("parent of %d is %d\n", node_idx, parent_IDX);
+        double *parent_childCosts = childCosts + child_num_sum[parent_IDX] * MAX_LAYER;
+        int *parent_childCosts_road = childCosts_road + child_num_sum[parent_IDX] * MAX_LAYER;
+        // unsigned long long *parent_packed_information = packed_information + child_num_sum[parent_IDX] * MAX_LAYER;
+        int px = nodes[parent_IDX] / Y % X, py = nodes[parent_IDX] % Y; 
+        assert(px==node_x||py==node_y);
+        for(int layer = MIN_ROUTE_LAYER; layer<MAX_LAYER; layer++)
+        {
+            if((layer & 1 ^ DIR) == 1 && node_y != py) continue;
+            if((layer & 1 ^ DIR) == 0 && node_x != px) continue;
+            int index_ = child_index_of_current_node * MAX_LAYER + layer;
+            double cost = costs[node_idx * MAX_LAYER + layer] + graph::wire_segment_cost(layer-1, min(node_x, px), max(node_x, px), min(node_y, py), max(node_y, py));
+            // int shift_modify = child_num_sum[parent_IDX] * MAX_LAYER + index_;
+            // printf("shift_modify = %d\n",shift_modify);
+            // cost = truncate(cost);
+            // while(atomicCAS(&locks[shift_modify], 0, 1) != 0);
+            // __threadfence();
+            
+            // atomicMin(parent_packed_information + index_, packCostAndNodeId(cost, node_idx));
+            atomicMinDouble(&parent_childCosts[index_], cost);
+            if(parent_childCosts[index_]==cost)
+            {
+                parent_childCosts_road[index_] = node_idx;
+            }
+            // assert(cost!=parent_childCosts[index_])
+            // cost = myTruncate(cost);
+            // parent_childCosts[index_] = myTruncate(parent_childCosts[index_]);
+            // if (cost<parent_childCosts[index_])
+            // {
+            //     parent_childCosts_road[index_] = node_idx;
+            //     parent_childCosts[index_] = cost;
+            //     // atomicMin(&parent_childCosts_road[index_], node_idx);
+            // }
+            // else if((cost==parent_childCosts[index_]&&node_idx<parent_childCosts_road[index_]))
+            // {
+            //     parent_childCosts_road[index_] = node_idx;
+            // }
+            // __threadfence();
+            // atomicExch(&locks[shift_modify], 0);
+        }
+    }
+}
+
+__global__ void Lshape_route_node_layer_change_cuda(int shift, int end_shift) {
+    int node_sequence = blockIdx.x * blockDim.x + threadIdx.x + shift;
+    if(node_sequence>=end_shift)
+    {
+        return;
+    }
+    int node_idx = depth_node[node_sequence];
+    int parent_num_cur = par_num_sum[node_idx+1]-par_num_sum[node_idx];
+    int fixed_layer_low = 1 + nodes[node_idx] / X / Y;
+    int x = nodes[node_idx] / Y % X, y = nodes[node_idx] % Y;
+    int fixed_layer_high = fixed_layer_low==10?0:fixed_layer_low;
+    int cur_child_num = child_num_sum[node_idx+1]-child_num_sum[node_idx];
+
+    int *cur_best_path = best_path + child_num_sum[node_idx] * MAX_LAYER;
     double *cur_childCosts = childCosts + child_num_sum[node_idx] * MAX_LAYER;
     int *cur_childCosts_road = childCosts_road + child_num_sum[node_idx] * MAX_LAYER;
     unsigned long long *cur_packed_information = packed_information + child_num_sum[node_idx] * MAX_LAYER;
     double minChildCosts[6];
     int bestPaths[6];
     for (int lowLayerIndex = MIN_ROUTE_LAYER; lowLayerIndex <= fixed_layer_low; lowLayerIndex++) {
-        for(int cid = 0; cid < cur_child_num; cid++)
+        for(int cid=0; cid<cur_child_num; cid++)
         {
             minChildCosts[cid] = INF;
+            // bestPaths[cid] = 0;
         }
         double via_cost = 0;
+        // int original_min = lowLayerIndex;
         for (int layerIndex = lowLayerIndex; layerIndex < (L+1); layerIndex++) {
             if(layerIndex>lowLayerIndex)
             {   
+                // min value of lowLayerIndex is 1 
                 via_cost += vcost[IDX(layerIndex - 2, x, y)];
             }
+            // int min_layer = 10;
             for (int childIndex = 0; childIndex < cur_child_num; childIndex++) {
+                double cur_child_cost = cur_childCosts[childIndex * MAX_LAYER + layerIndex];
                 double cost;
                 int nodeddd;
                 unpackCostAndNodeId(cur_packed_information[childIndex * MAX_LAYER + layerIndex], &cost, &nodeddd);
-                assert(nodeddd>=0);
-                double cur_child_cost = cost;
+                // if(cost!=cur_child_cost)
+                // {
+                //     printf("cost = %f, cur_child_cost = %f\n", cost, cur_child_cost);
+                // }
+                // if(nodeddd!=cur_childCosts_road[childIndex * MAX_LAYER + layerIndex])
+                // {
+                //     printf("nodeddd = %d, cur_childCosts_road = %d\n", nodeddd, cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]);
+                // }
+                // assert(nodeddd==cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]);
+                // assert(cost==cur_child_cost);
+                cur_child_cost = cost;
+                cur_childCosts_road[childIndex * MAX_LAYER + layerIndex] = nodeddd;
                 if (cur_child_cost < minChildCosts[childIndex]) {
                     minChildCosts[childIndex] = cur_child_cost;
-                    bestPaths[childIndex] = nodeddd * MAX_LAYER + layerIndex;
+                    // int node_id_with_possibility_child = unpackNodeId(packed_information[childIndex * MAX_LAYER + layerIndex]);
+                    // assert(node_id_with_possibility_child==cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]);
+                    bestPaths[childIndex] = cur_childCosts_road[childIndex * MAX_LAYER + layerIndex] * MAX_LAYER + layerIndex;//根据进的layer决定的,input_layer
+                    int possibility_choosed = cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]%100;
+                    if(possibility_choosed!=82)
+                    {
+                        if(!(layerIndex==((cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]%100)%9+1)))
+                        {
+                            printf("possibility_choosed = %d, target layer = %d, layerIndex = %d\n", cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]%100, 
+                                      (cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]%100)%9, layerIndex);
+                        }
+                        assert(layerIndex==((cur_childCosts_road[childIndex * MAX_LAYER + layerIndex]%100)%9+1));
+                    }
                 }
             }
             if (layerIndex >= fixed_layer_high) {
@@ -265,94 +559,6 @@ __global__ void Lshape_route_node_cuda(int shift, int end_shift) {
     for(int par_id = 0; par_id < parent_num_cur; par_id++)
     {
         int parent_IDX = par_nodes[par_num_sum[node_idx] + par_id];
-        int child_index_of_current_node = currentChildIDX[par_num_sum[node_idx] + par_id]%10;
-        double *parent_childCosts = childCosts + child_num_sum[parent_IDX] * MAX_LAYER;
-        int *parent_childCosts_road = childCosts_road + child_num_sum[parent_IDX] * MAX_LAYER;
-        unsigned long long *parent_packed_information = packed_information + child_num_sum[parent_IDX] * MAX_LAYER;
-        int px = nodes[parent_IDX] / Y % X, py = nodes[parent_IDX] % Y; 
-        assert(px==node_x||py==node_y);
-        for(int layer = MIN_ROUTE_LAYER; layer<MAX_LAYER; layer++)
-        {
-            if((layer & 1 ^ DIR) == 1 && node_y != py) continue;
-            if((layer & 1 ^ DIR) == 0 && node_x != px) continue;
-            int index_ = child_index_of_current_node * MAX_LAYER + layer;
-            double cost = costs[node_idx * MAX_LAYER + layer] + graph::wire_segment_cost(layer-1, min(node_x, px), max(node_x, px), min(node_y, py), max(node_y, py));
-            atomicMin(parent_packed_information + index_, packCostAndNodeId(cost, node_idx));
-        }
-    }
-}
-
-__global__ void Lshape_route_node_layer_change_cuda(int shift, int end_shift) {
-    int node_sequence = blockIdx.x * blockDim.x + threadIdx.x + shift;
-    if(node_sequence>=end_shift)
-    {
-        return;
-    }
-    int node_idx = depth_node[node_sequence];
-    int parent_num_cur = par_num_sum[node_idx+1]-par_num_sum[node_idx];
-    int fixed_layer_low = 1 + nodes[node_idx] / X / Y;
-    int x = nodes[node_idx] / Y % X, y = nodes[node_idx] % Y;
-    int fixed_layer_high = fixed_layer_low==10?0:fixed_layer_low;
-    int cur_child_num = child_num_sum[node_idx+1]-child_num_sum[node_idx];
-
-    unsigned long long *cur_best_path = best_path + child_num_sum[node_idx] * MAX_LAYER;
-    double *cur_childCosts = childCosts + child_num_sum[node_idx] * MAX_LAYER;
-    int *cur_childCosts_road = childCosts_road + child_num_sum[node_idx] * MAX_LAYER;
-    unsigned long long *cur_packed_information = packed_information + child_num_sum[node_idx] * MAX_LAYER;
-    double minChildCosts[5];
-    unsigned long long bestPaths[5];
-    for (int lowLayerIndex = MIN_ROUTE_LAYER; lowLayerIndex <= fixed_layer_low; lowLayerIndex++) {
-        for(int cid = 0; cid<cur_child_num; cid++)
-        {
-            minChildCosts[cid] = INF;
-        }
-        double via_cost = 0;
-        for (int layerIndex = lowLayerIndex; layerIndex < (L+1); layerIndex++) {
-            if(layerIndex>lowLayerIndex)
-            {   
-                via_cost += vcost[IDX(layerIndex - 2, x, y)];
-            }
-            for (int childIndex = 0; childIndex < cur_child_num; childIndex++) {
-                double cost;
-                int nodeddd;
-                unpackCostAndNodeId(cur_packed_information[childIndex * MAX_LAYER + layerIndex], &cost, &nodeddd);
-                double cur_child_cost = cost;
-                assert(nodeddd >= 0);
-                if (cur_child_cost < minChildCosts[childIndex]) {
-                    minChildCosts[childIndex] = cur_child_cost;
-                    bestPaths[childIndex] = (unsigned long long)nodeddd * MAX_LAYER + layerIndex;
-                }
-            }
-            if (layerIndex >= fixed_layer_high) {
-                double cost = via_cost;
-                for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
-                {
-                    cost += minChildCosts[childIndex];
-                }
-                if (cost<INF && cost < costs[node_idx * MAX_LAYER+layerIndex]) {
-                    costs[node_idx * MAX_LAYER + layerIndex] = cost;
-                    for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
-                    {
-                        cur_best_path[childIndex * MAX_LAYER + layerIndex] = bestPaths[childIndex];
-                    }
-                }
-            }
-        }
-        for (int layerIndex = (L+1) - 2; layerIndex >= lowLayerIndex; layerIndex--) {//
-            if (costs[node_idx*MAX_LAYER+layerIndex + 1] < costs[node_idx*MAX_LAYER+layerIndex]) {
-                costs[node_idx*MAX_LAYER+layerIndex] = costs[node_idx*MAX_LAYER+layerIndex + 1];
-                for (int childIndex = 0; childIndex < cur_child_num; childIndex++)
-                {
-                    cur_best_path[childIndex * MAX_LAYER + layerIndex] = cur_best_path[childIndex * MAX_LAYER + layerIndex+1];
-                }
-            }
-        }
-    }
-    int node_x = nodes[node_idx] / Y % X, node_y = nodes[node_idx] % Y; 
-    unsigned long long packed_information_cache[11];
-    for(int par_id = 0; par_id < parent_num_cur; par_id++)
-    {
-        int parent_IDX = par_nodes[par_num_sum[node_idx] + par_id];
         int child_index_of_current_node = currentChildIDX[par_num_sum[node_idx] + par_id] % 10;
         int parent_shift_base = child_num_sum[parent_IDX] * MAX_LAYER;
         double *parent_childCosts = childCosts + parent_shift_base;
@@ -360,31 +566,33 @@ __global__ void Lshape_route_node_layer_change_cuda(int shift, int end_shift) {
         unsigned long long *parent_packed_information = packed_information + parent_shift_base;
         int px = nodes[parent_IDX] / Y % X, py = nodes[parent_IDX] % Y;
         int minx = min(node_x, px), maxx = max(node_x, px), miny = min(node_y, py), maxy = max(node_y, py);
-        assert(px == node_x || py == node_y);
-        
-        for(int target_layer=0; target_layer<MAX_LAYER; target_layer++)
-        {
-            if((target_layer<MIN_ROUTE_LAYER)||(target_layer>=MAX_LAYER)) continue;
-            int index_ = child_index_of_current_node * MAX_LAYER + target_layer;
-            packed_information_cache[target_layer] = *(parent_packed_information + index_);
-        }
+        assert(px==node_x||py==node_y);
+        // if(abs(node_x-px)+abs(node_y-py)>6)
         for(int layer = MIN_ROUTE_LAYER; layer < MAX_LAYER; layer++) // output=1-9
         {
             if((layer & 1 ^ DIR) == 1 && node_y != py) continue;
             if((layer & 1 ^ DIR) == 0 && node_x != px) continue;
             double cost_base = costs[node_idx * MAX_LAYER + layer];
             assert(cost_base<INF);
+            // if(abs(node_x-px)+abs(node_y-py)>4)
             for(int target_layer = MIN_ROUTE_LAYER + (1 - layer%2); target_layer< MAX_LAYER; target_layer+=2)
+            // for(int target_layer = layer - 2; target_layer< layer + 2; target_layer+=2)
             {
                 if((target_layer<MIN_ROUTE_LAYER)||(target_layer>=MAX_LAYER)) continue;
+                // if((target_layer%2)!=(layer%2)) continue;
+                // printf("trying %d layer to %d layer\n", layer, target_layer);
+                // int index_ = child_index_of_current_node * MAX_LAYER + layer;
                 int index_ = child_index_of_current_node * MAX_LAYER + target_layer;
                 double cost2 = INF;
                 int shift_modify = parent_shift_base + index_;
                 int possibility_choosed = 82;
+                // int change_point;
                 if((target_layer == layer))
                 {
                     cost2 = cost_base + graph::wire_segment_cost(layer-1, minx, maxx, miny, maxy);
                 }
+                // else continue;
+                // else if((node_x!=px)||(node_y!=py)){
                 else if(abs(node_x-px)+abs(node_y-py)>4){
                     int possibility_sequence = (layer-1) * 9 + (target_layer-1);
                     double c_e = cost_edges[(par_num_sum[node_idx] + par_id) * 81 + possibility_sequence];
@@ -398,20 +606,194 @@ __global__ void Lshape_route_node_layer_change_cuda(int shift, int end_shift) {
                 else{
                     continue;
                 }
-                volatile unsigned long long new_value = packCostAndNodeId(cost2, node_idx * 100 + possibility_choosed);
-                if(new_value<packed_information_cache[target_layer])
+                // // non deterministic version
+                // unsigned long long checkkk = packCostAndNodeId(1.01e22, 200000000);
+                // printf("checkkk = %lld\n", checkkk);
+                // double checkkkcost;
+                // int checkkknodeddd;
+                // unpackCostAndNodeId(checkkk, &checkkkcost, &checkkknodeddd);
+                // printf("checking   %lf, %d\n", checkkkcost, checkkknodeddd);
+                // assert(0);
+                atomicMin(parent_packed_information + index_, packCostAndNodeId(cost2, node_idx * 100 + possibility_choosed));
+                // if(cost2 < parent_childCosts[index_])
+                // {
+                //     atomicMinDouble(&parent_childCosts[index_], cost2);// here it is very risky to trigger compete condition
+                //     if(parent_childCosts[index_]==cost2)
+                //     {
+                //         parent_childCosts_road[index_] = node_idx * 100 + possibility_choosed;
+                //     }
+                // }// non deterministic version
+
+                /////////////////////// deterministic version
+                // very risky operation!
+                // if(cost2 <= parent_childCosts[index_]){
+                //     atomicMinCostAndPath(&parent_childCosts[index_], &parent_childCosts_road[index_], cost2, node_idx * 100 + possibility_choosed);
+                // }
+
+                // while(atomicCAS(&locks[index_], 0, 1) != 0);
+                // __threadfence();
+                // if(cost2 <= parent_childCosts[index_])
+                // {
+                //     // atomicMinDouble(&parent_childCosts[index_], cost2);// here it is very risky to trigger compete condition
+                //     if(parent_childCosts[index_]>cost2)
+                //     {
+                //         parent_childCosts[index_]=cost2;
+                //         parent_childCosts_road[index_] = node_idx * 100 + possibility_choosed;
+                //         /* debug
+                //         if(((node_x!=px)||(node_y!=py)) && cost_edges[(par_num_sum[node_idx] + par_id) * 81 + (layer-1) * 9 + (target_layer-1)] < INF)
+                //         if(best_change[(par_num_sum[node_idx] + par_id) * 81 + (layer-1) * 9 + (target_layer-1)] == -1)
+                //         {
+                //             printf("error!!! cost2 = %f, cost1 = %f, cost_edge = %f, layer = %d, target_layer = %d\n", cost2, costs[node_idx * MAX_LAYER + layer], 
+                //                 cost_edges[(par_num_sum[node_idx] + par_id) * 81 + (layer-1) * 9 + (target_layer-1)], layer, target_layer);
+                //         }
+                //         */
+                //         // printf("record possibility! %d\n", possibility_choosed);
+                //         // parent_childCosts_road[index_] = node_idx;
+                //     }else if(parent_childCosts_road[index_] > node_idx * 100 + possibility_choosed){
+                //         parent_childCosts_road[index_] = node_idx * 100 + possibility_choosed;
+                //     }
+                // }
+                // __threadfence();
+                // atomicExch(&locks[index_], 0);
+                /////////////////////// deterministic version
+            }
+        }
+        // else{
+        //     for(int layer = MIN_ROUTE_LAYER; layer<MAX_LAYER; layer++)
+        //     {
+        //         if((layer & 1 ^ DIR) == 1 && node_y != py) continue;
+        //         if((layer & 1 ^ DIR) == 0 && node_x != px) continue;
+        //         int index_ = child_index_of_current_node * MAX_LAYER + layer;
+        //         double cost = costs[node_idx * MAX_LAYER + layer] + graph::wire_segment_cost(layer-1, min(node_x, px), max(node_x, px), min(node_y, py), max(node_y, py));
+        //         int shift_modify = child_num_sum[parent_IDX] * MAX_LAYER + index_;
+        //         atomicMinDouble(&parent_childCosts[index_], cost);
+        //         if(parent_childCosts[index_]==cost)
+        //         {
+        //             parent_childCosts_road[index_] = node_idx * 100 + 82;
+        //         }
+        //     }
+        // }
+        
+    }
+}
+
+__global__ void Lshape_route_node_cuda2(int shift, int end_shift) {
+    int node_sequence = blockIdx.x * blockDim.x + threadIdx.x + shift;
+    if(node_sequence>=end_shift)
+    {
+        return;
+    }
+    int node_idx = depth_node[node_sequence];
+    // printf("visiting node %d\n", node_idx);
+    int parent_num_cur = par_num_sum[node_idx+1]-par_num_sum[node_idx];
+    int fixed_layer_low = 1 + nodes[node_idx] / X / Y;
+    int x = nodes[node_idx] / Y % X, y = nodes[node_idx] % Y;
+    int fixed_layer_high = (fixed_layer_low==10)?0:fixed_layer_low;
+    int cur_child_num = child_num_sum[node_idx+1]-child_num_sum[node_idx];
+
+    int *cur_best_path = best_path + child_num_sum[node_idx] * MAX_LAYER;
+    double *cur_childCosts = childCosts + child_num_sum[node_idx] * MAX_LAYER;
+    int *cur_childCosts_road = childCosts_road + child_num_sum[node_idx] * MAX_LAYER;
+    if(cur_child_num==0)
+    {
+        int min_layer = fixed_layer_low;
+        int max_layer = fixed_layer_high;
+        for(int layer_idx=MIN_ROUTE_LAYER; layer_idx< MAX_LAYER; layer_idx++) {
+            int lowest_layer = min(min_layer, layer_idx);
+            int highest_layer = max(max_layer, layer_idx);
+            double via_cost = 0;
+            for(int l = lowest_layer; l < highest_layer; l++)
+            {
+                // if(layer_idx != l)// output layer
+                // {
+                    via_cost += vcost[IDX(l - 1,  x, y)];
+                // }
+            }
+            costs[node_idx*MAX_LAYER+layer_idx] = via_cost;
+        }
+    }
+    else
+    {
+        int possibilities = 1;
+        for(int i=0;i<cur_child_num;i++) possibilities*=(L + 1 - MIN_ROUTE_LAYER); // % 9+1-1 = 9 ,,,,,, 1-9
+        for(int enum_idx = 0; enum_idx < possibilities; enum_idx++)
+        {
+            int min_layer = fixed_layer_low;
+            int max_layer = fixed_layer_high;
+            // printf("enumerating %d\n", enum_idx);
+            double cost = 0;
+            int appear[10];
+            for(int i=0; i < 10; i++)
+            {
+                appear[i] = 0;
+            }
+            int tmp_scheme = enum_idx;
+            // printf("child_layer = ");
+            for(int childIndex=0;childIndex<cur_child_num;childIndex++)
+            {
+                int child_layer = tmp_scheme%(L + 1 -MIN_ROUTE_LAYER) + 1;
+                // printf("%d ", child_layer);
+                appear[child_layer] = 1;
+                cost += cur_childCosts[childIndex * MAX_LAYER + child_layer];
+                tmp_scheme/=(L + 1 - MIN_ROUTE_LAYER);
+                max_layer = max(max_layer, child_layer);
+                min_layer = min(min_layer, child_layer);
+            }
+            for(int l=MIN_ROUTE_LAYER; l< MAX_LAYER; l++)// output layer
+            {
+                int lowest_layer = min(min_layer, l);
+                int highest_layer = max(max_layer, l);
+                double cost_update = cost;
+                for(int ll = lowest_layer; ll < highest_layer; ll++)
                 {
-                    packed_information_cache[target_layer] = new_value;
+                    // if(!appear[ll] && l != ll)
+                    // {
+                        cost_update += vcost[IDX(ll - 1,  x, y)];
+                    // }
+                }
+                assert(cost_update >= 0);
+                if (cost_update < INF && cost_update < costs[node_idx * MAX_LAYER + l]) 
+                {
+                    costs[node_idx * MAX_LAYER + l] = cost_update;
+                    tmp_scheme = enum_idx;
+                    for(int childIndex = 0; childIndex < cur_child_num; childIndex++)
+                    {
+                        int child_layer = tmp_scheme%(L + 1 - MIN_ROUTE_LAYER) + 1;
+                        tmp_scheme /= (L + 1 - MIN_ROUTE_LAYER);
+                        cur_best_path[childIndex * MAX_LAYER + l] = cur_childCosts_road[childIndex * MAX_LAYER + child_layer] * MAX_LAYER + child_layer;
+                    }
                 }
             }
         }
-        
-        for(int target_layer = MIN_ROUTE_LAYER; target_layer< MAX_LAYER; target_layer++)
+    }
+    
+    int node_x = nodes[node_idx] / Y % X, node_y = nodes[node_idx] % Y;
+    for(int par_id = 0; par_id < parent_num_cur; par_id++)
+    {
+        int parent_IDX = par_nodes[par_num_sum[node_idx] + par_id];
+        int child_index_of_current_node = currentChildIDX[par_num_sum[node_idx] + par_id];
+        double *parent_childCosts = childCosts + child_num_sum[parent_IDX] * MAX_LAYER;
+        int *parent_childCosts_road = childCosts_road + child_num_sum[parent_IDX] * MAX_LAYER;
+        int px = nodes[parent_IDX] / Y % X, py = nodes[parent_IDX] % Y; 
+        assert(px==node_x||py==node_y);
+        for(int layer = MIN_ROUTE_LAYER; layer<MAX_LAYER; layer++) //output=1-9
         {
-            if((target_layer<MIN_ROUTE_LAYER)||(target_layer>=MAX_LAYER)) continue;
-            int index_ = child_index_of_current_node * MAX_LAYER + target_layer;
-            atomicMin(parent_packed_information + index_, packed_information_cache[target_layer]);//@@
-        }   
+            if((layer & 1 ^ DIR) == 1 && node_y != py) continue;
+            if((layer & 1 ^ DIR) == 0 && node_x != px) continue;
+            int index_ = child_index_of_current_node * MAX_LAYER + layer;
+            assert(costs[node_idx * MAX_LAYER + layer]<INF);
+            double cost2 = costs[node_idx * MAX_LAYER + layer] + graph::wire_segment_cost(layer-1, min(node_x, px), max(node_x, px), min(node_y, py), max(node_y, py));
+            int shift_modify = child_num_sum[parent_IDX] * MAX_LAYER + index_;
+            // while(atomicCAS(&locks[shift_modify], 0, 1) != 0);
+            // __threadfence();
+            atomicMinDouble(&parent_childCosts[index_], cost2);
+            if(parent_childCosts[index_]==cost2)
+            {
+                parent_childCosts_road[index_] = node_idx;
+            }
+            // __threadfence();
+            // atomicExch(&locks[shift_modify], 0);
+        }
     }
 }
 
@@ -423,10 +805,8 @@ __global__ void get_routing_tree_cuda(int shift, int end_shift, int depth, int s
     }
     int node_id = depth_node[node_sequence];
     int net_id = node_net_idx[node_id];
-    assert(net_id<NET_NUM);
-    assert(pin_acc_num_phase2[net_id]>=0);
-    int *net_routes = routes_phase2 + pin_acc_num_phase2[net_id] * ROUTE_PER_PIN_PHASE2;
-    unsigned long long *cur_best_path = best_path + child_num_sum[node_id] * MAX_LAYER;
+    int *net_routes = routes + pin_acc_num[net_id] * ROUTE_PER_PIN;
+    int *cur_best_path = best_path + child_num_sum[node_id] * MAX_LAYER;
 
     int l = nodes[node_id] / Y / X;
     int cur_x = nodes[node_id] / Y % X, cur_y = nodes[node_id] % Y;
@@ -457,10 +837,9 @@ __global__ void get_routing_tree_cuda(int shift, int end_shift, int depth, int s
                 par_sequence = par_id;
                 par_layer = layer_output[par_node];
                 int child_index_of_current_node = currentChildIDX[par_num_sum[node_id]+par_sequence]%10;
-                unsigned long long *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
-                unsigned long long path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
+                int *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
+                int path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
                 int child_idx = path / MAX_LAYER;
-                assert(child_idx>=0);
                 if(child_idx == node_id)
                 {
                     layer_output[node_id] = path % MAX_LAYER;
@@ -472,7 +851,6 @@ __global__ void get_routing_tree_cuda(int shift, int end_shift, int depth, int s
                         int idd1 = atomicAdd(net_routes,2);
                         net_routes[idd1] = IDX(layer_output[node_id] - 1, px, min(py,cur_y));
                         net_routes[idd1+1] = IDX(layer_output[node_id] - 1, px, max(py,cur_y));
-                        assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                     }
                     else if(py==cur_y && cur_x != px)
                     {
@@ -480,7 +858,6 @@ __global__ void get_routing_tree_cuda(int shift, int end_shift, int depth, int s
                         int idd1 = atomicAdd(net_routes,2);
                         net_routes[idd1] = IDX(layer_output[node_id] - 1, min(px,cur_x), py);
                         net_routes[idd1+1] = IDX(layer_output[node_id] - 1, max(px,cur_x), py);
-                        assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                     }
                     break;
                 }else{
@@ -491,22 +868,25 @@ __global__ void get_routing_tree_cuda(int shift, int end_shift, int depth, int s
         if(par_layer==-1)
         {
             layer_output[node_id] = -1;
+            // printf("node %d's parents are all disconnected, current depth = %d\n", node_id, depth);
+            // assert(0);
             return;
         }
         int child_index_of_current_node = currentChildIDX[par_num_sum[node_id]+par_sequence]%10;
-        unsigned long long *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
-        unsigned long long path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
-        unsigned long long child_idx = path / MAX_LAYER;
-        assert(child_idx>=0);
+        int *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
+        int path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
+        int child_idx = path / MAX_LAYER;
         if( child_idx != node_id)
         {
             layer_output[node_id] = -1;
+            // printf("parent_childCosts_road shift = %d, value = %d\n", childCosts_road + child_num_sum[parent_IDX] * MAX_LAYER + index_, node_idx);
             return;
         }
     }
     int num_child = child_num_sum[node_id+1] - child_num_sum[node_id];
-    int minl = l+1;
+    int minl = l+1;//l:0-8-->2nd - 10th layers
     int maxl = (l+1)==MAX_LAYER?1:minl;
+    // printf("minl = %d, maxl = %d\n", minl, maxl);
     minl = min(minl,layer_output[node_id]);
     maxl = max(maxl,layer_output[node_id]);
     assert(num_child>=0);
@@ -525,7 +905,6 @@ __global__ void get_routing_tree_cuda(int shift, int end_shift, int depth, int s
         int idd1 = atomicAdd(net_routes,2);
         net_routes[idd1] = IDX(minl - 1, cur_x, cur_y);
         net_routes[idd1+1] = IDX(maxl - 1, cur_x, cur_y);
-        assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
     }
 }
 
@@ -538,11 +917,8 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
     }
     int node_id = depth_node[node_sequence];
     int net_id = node_net_idx[node_id];
-    assert(net_id<NET_NUM);
-    assert(pin_acc_num_phase2[net_id]>=0);
-    int *net_routes = routes_phase2 + pin_acc_num_phase2[net_id] * ROUTE_PER_PIN_PHASE2;
-
-    unsigned long long *cur_best_path = best_path + child_num_sum[node_id] * MAX_LAYER;
+    int *net_routes = routes + pin_acc_num[net_id] * ROUTE_PER_PIN;
+    int *cur_best_path = best_path + child_num_sum[node_id] * MAX_LAYER;
 
     int l = nodes[node_id] / Y / X;
     int cur_x = nodes[node_id] / Y % X, cur_y = nodes[node_id] % Y;
@@ -568,27 +944,29 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
         {
             int edge_id = par_num_sum[node_id]+par_id;
             int par_node = par_nodes[par_num_sum[node_id]+par_id];
-            if(layer_output[par_node]>0)
+            if(layer_output[par_node]>=0)
             {
                 par_idx = par_node;
                 par_sequence = par_id;
                 par_layer = layer_output[par_node];
                 int child_index_of_current_node = currentChildIDX[par_num_sum[node_id]+par_sequence]%10;
-                unsigned long long *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
-                unsigned long long path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
-                assert(path>=0);
-                unsigned long long child_idx = path / MAX_LAYER / 100;
-                assert(child_idx>=0);
-                unsigned long long possibility_choosed = (path / MAX_LAYER) % 100;
+                int *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
+                int path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
+                int child_idx = path / MAX_LAYER / 100;
+                int possibility_choosed = (path / MAX_LAYER) % 100;
+                // int child_idx = path / MAX_LAYER;
+                // int possibility_choosed = 82;
                 if(child_idx == node_id)
                 {
+                    // assert(possibility_choosed==82);
                     if(possibility_choosed==82)
                     {
-                        layer_output[node_id] = path % MAX_LAYER;
+                        layer_output[node_id] = path % MAX_LAYER;// TODO need to modify
                     }
                     else{
                         layer_output[node_id] = possibility_choosed / 9 + 1;
                     }
+                    // printf("logg possibility_choosed = %d, layer_output = %d\n", possibility_choosed, layer_output[node_id]);
                     int px = nodes[par_idx] / Y % X, py = nodes[par_idx] % Y;
                     assert(px==cur_x||py==cur_y); 
                     if(px==cur_x && cur_y!=py)
@@ -597,11 +975,8 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
                         {
                             graph::atomic_add_unit_demand_wire_segment(layer_output[node_id] - 1, px, px, min(py,cur_y), max(py,cur_y), stamp);
                             int idd1 = atomicAdd(net_routes,2);
-                            assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                             net_routes[idd1] = IDX(layer_output[node_id] - 1, px, min(py,cur_y));
                             net_routes[idd1+1] = IDX(layer_output[node_id] - 1, px, max(py,cur_y));
-                            assert(IDX(layer_output[node_id] - 1, px, min(py,cur_y))>=0);
-                            assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                         }
                         else{
                             assert(possibility_choosed<81);
@@ -609,11 +984,16 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
                             int to_layer = possibility_choosed % 9;
                             assert((path % MAX_LAYER)==(to_layer + 1));
                             int change_pos = best_change[edge_id * 81 + from_layer * 9 + to_layer];
-
+                            if(!(change_pos>min(cur_y, py)))
+                            {
+                                printf("possibility = %d, from_layer = %d, to_layer = %d, change_pos = %d, cur_y = %d, py = %d\n", 
+                                        possibility_choosed, from_layer, to_layer, change_pos, cur_y, py);
+                            }
                             assert(change_pos>min(cur_y, py));
                             assert(change_pos<max(cur_y, py));
                             assert((from_layer%2)==(to_layer%2));
                             assert((from_layer%2)==0);// vertical
+                            //change_point只记载移动方向的位置即可
                             graph::atomic_add_unit_demand_wire_segment(from_layer, cur_x, cur_x, min(cur_y,change_pos), max(cur_y,change_pos), stamp);
                             graph::atomic_add_unit_demand_wire_segment(to_layer, cur_x, cur_x, min(py,change_pos), max(py,change_pos), stamp);
                             int idd1 = atomicAdd(net_routes,6);
@@ -624,7 +1004,6 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
                             net_routes[idd1+3] = IDX(max(from_layer, to_layer), cur_x, change_pos);
                             net_routes[idd1+4] = IDX(to_layer, cur_x, min(py,change_pos));
                             net_routes[idd1+5] = IDX(to_layer, cur_x,  max(py,change_pos));
-                            assert(idd1+5<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                         }
                     }
                     else if(py==cur_y && cur_x != px)
@@ -635,8 +1014,6 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
                             int idd1 = atomicAdd(net_routes,2);
                             net_routes[idd1] = IDX(layer_output[node_id] - 1, min(px,cur_x), py);
                             net_routes[idd1+1] = IDX(layer_output[node_id] - 1, max(px,cur_x), py);
-                            assert(IDX(layer_output[node_id] - 1, min(px,cur_x), py)>=0);
-                            assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                         }
                         else{
                             assert(possibility_choosed<81);
@@ -648,6 +1025,7 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
                             assert(change_pos<max(cur_x, px));
                             assert((from_layer%2)==(to_layer%2));
                             assert((from_layer%2)==1);
+                            //change_point只记载移动方向的位置即可
                             graph::atomic_add_unit_demand_wire_segment(from_layer, min(cur_x,change_pos), max(cur_x,change_pos), cur_y, cur_y, stamp);
                             graph::atomic_add_unit_demand_wire_segment(to_layer, min(px,change_pos), max(px,change_pos), cur_y, cur_y, stamp);
                             int idd1 = atomicAdd(net_routes,6);
@@ -658,7 +1036,6 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
                             net_routes[idd1+3] = IDX(max(from_layer, to_layer), change_pos, cur_y);
                             net_routes[idd1+4] = IDX(to_layer, min(px,change_pos), cur_y);
                             net_routes[idd1+5] = IDX(to_layer, max(px,change_pos), cur_y);
-                            assert(idd1+5<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
                         }
                     }
                     break;
@@ -670,21 +1047,26 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
         if(par_layer==-1)
         {
             layer_output[node_id] = -1;
+            // printf("node %d's parents are all disconnected, current depth = %d\n", node_id, depth);
+            // assert(0);
             return;
         }
         int child_index_of_current_node = currentChildIDX[par_num_sum[node_id]+par_sequence]%10;
-        unsigned long long *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
-        unsigned long long path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
-        unsigned long long child_idx = path / MAX_LAYER / 100;
+        int *par_best_path = best_path + child_num_sum[par_idx] * MAX_LAYER;
+        int path = par_best_path[child_index_of_current_node * MAX_LAYER + par_layer];
+        // int child_idx = path / MAX_LAYER;//TODO modofy here
+        int child_idx = path / MAX_LAYER / 100;//TODO modofy here
         if( child_idx != node_id)
         {
             layer_output[node_id] = -1;
+            // printf("parent_childCosts_road shift = %d, value = %d\n", childCosts_road + child_num_sum[parent_IDX] * MAX_LAYER + index_, node_idx);
             return;
         }
     }
     int num_child = child_num_sum[node_id+1] - child_num_sum[node_id];
-    int minl = l+1; //l:0-8-->2nd - 10th layers
+    int minl = l+1;//l:0-8-->2nd - 10th layers
     int maxl = (l+1)==MAX_LAYER?1:minl;
+    // printf("minl = %d, maxl = %d\n", minl, maxl);
     minl = min(minl,layer_output[node_id]);
     maxl = max(maxl,layer_output[node_id]);
     assert(num_child>=0);
@@ -698,13 +1080,12 @@ __global__ void get_routing_tree_layer_change_cuda(int shift, int end_shift, int
             maxl = max(layer_of_child, maxl);
         }
     }
+    // printf("finish checking node %d, have %d childs, depth %d\n", node_id, num_child, depth);
     if(minl<maxl)
     {
         int idd1 = atomicAdd(net_routes,2);
         net_routes[idd1] = IDX(minl - 1, cur_x, cur_y);
         net_routes[idd1+1] = IDX(maxl - 1, cur_x, cur_y);
-        assert(IDX(minl - 1, cur_x, cur_y)>=0);
-        assert(idd1+1<ROUTE_PER_PIN_PHASE2*(pin_acc_num[net_id+1]-pin_acc_num[net_id]));
     }
 }
 
@@ -721,7 +1102,7 @@ void process_net(int thread_idx, vector<int> &nets2route, int thread_num, std::a
         if (netId >= nets2route.size()) {
             break;
         }
-        nets[nets2route[netId]].generate_detours_reconstruct(congestionView_cpu, congestionView_xsum_cpu, congestionView_ysum_cpu, false, is_show);
+        nets[nets2route[netId]].generate_detours(move(congestionView_cpu), move(congestionView_xsum_cpu), move(congestionView_ysum_cpu), false, is_show);
     }
 }
 
@@ -753,6 +1134,9 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
     cudaMemcpy(congestionView_cpu, congestion, X * Y * sizeof(bool), cudaMemcpyDeviceToHost);
     cudaMemcpy(congestionView_xsum_cpu, congestion_xsum, X * Y * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(congestionView_ysum_cpu, congestion_ysum, X * Y * sizeof(float), cudaMemcpyDeviceToHost);
+    // saveCongestion(std::string("congestion").c_str(),
+    //                       std::string("congestion_xsum").c_str(),
+    //                       std::string("congestion_ysum").c_str());
     if(LOG) printf("[%5.1f] Generating h,v segments Starts\n", elapsed_time());
     for(int i = 0; i < nets2route.size(); i++) {
         if(nets[nets2route[i]].rsmt.size()<1)
@@ -760,16 +1144,32 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
             nets[nets2route[i]].construct_rsmt();
         }
         int is_show = false;
+        // nets[nets2route[i]].generate_detours(congestionView_cpu, congestionView_xsum_cpu, congestionView_ysum_cpu, false, is_show);
     }
     multithreaded_processing(nets2route);
+    // #pragma omp parallel for num_threads(8)
+    // for(int i = 0; i < nets2route.size(); i++) {
+    //     int is_show = false;
+    //     nets[nets2route[i]].generate_detours(move(congestionView_cpu), move(congestionView_xsum_cpu), move(congestionView_ysum_cpu), false, is_show);
+    // }
+    // if(LOG)
+    // {
+    //     printf("create node time: %f\n", .count());
+    //     printf("connect_node time: %f\n", time22.count());
+    //     printf("get_mirror_places time: %f\n", time33.count());
+    //     printf("select_root time: %f\n", time44.count());
+    // }
     if(LOG) printf("[%5.1f] Generating h,v segments Ends\n", elapsed_time());
+    // exit(0);
     if(LOG) printf("[%5.1f] Generating batches Starts\n", elapsed_time());
-    auto batches = generate_batches_rsmt_gpu(nets2route, 300000);
+    // auto batches = generate_batches_rsmt(nets2route, 300000);
+    // auto batches = generate_batches_rsmt2(nets2route, 300000);
+    // auto batches = generate_batches_newnew(nets2route);
+    auto batches = generate_batches_rsmt2(nets2route, congestionView_cpu, 300000);
     if(LOG) printf("[%5.1f] Generating batches Ends\n", elapsed_time());
     int net_cnt_estimate=0;
     int node_num_max=0;
     int par_num_max=0;
-    print_GPU_memory_usage();
     for(int ii=0; ii<batches.size(); ii++)
     {
         int tmp = 0;
@@ -795,9 +1195,33 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
     }
 
     net_cnt_estimate += 5;
+    if(LOG) printf("net_cnt_estimate = %d\n", net_cnt_estimate);
     node_cnt_estimate = node_num_max + 10;
+    if(LOG) printf("node_estimate = %d\n", node_cnt_estimate);
     parent_cnt_estimate = par_num_max + 10;
+    if(LOG) printf("par_estimate = %d\n", parent_cnt_estimate);
     if(LOG) printf("[%5.1f] Lshape_route Starts\n", elapsed_time());
+    // /////////////////////////////////////////////////////////
+    // cudaMalloc(&macroBorder, X*Y*sizeof(int));
+    // macroBorder_cpu = new int[X * Y * sizeof(int)];
+    // distinguish_macroBorder<<<BLOCK_NUM(X * Y), THREAD_NUM>>>();
+    // distinguish_macroBorder_direction<<<BLOCK_NUM(X * Y), THREAD_NUM>>>();
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(macroBorder_cpu, macroBorder, X * Y * sizeof(int), cudaMemcpyDeviceToHost);
+    // FILE *file1 = fopen("border.txt", "w");
+    // for(int yy=0; yy<Y; yy++)
+    // {
+    //     for(int xx=0; xx<X; xx++)
+    //     {
+    //         fprintf(file1, "%d ", macroBorder_cpu[xx*Y+yy]);
+    //     }
+    //     fprintf(file1, "\n");
+    // }
+    // fclose(file1);
+    // /////////////////////////////////////////////////////////
+    // assert(0);
+    // cudaMalloc(&par_num, node_cnt_estimate * sizeof(int));
+    // cudaMalloc(&child_num, node_cnt_estimate * sizeof(int));
     cudaMalloc(&node_cnt_sum, net_cnt_estimate * sizeof(int));
     cudaMalloc(&nodes, node_cnt_estimate * sizeof(int));
     cudaMalloc(&net_depth, net_cnt_estimate * sizeof(int));
@@ -816,10 +1240,10 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
     cudaMalloc(&par_nodes, parent_cnt_estimate * sizeof(int));
     cudaMalloc(&cost_edges, parent_cnt_estimate * 81 * sizeof(double));
     cudaMalloc(&best_change, parent_cnt_estimate * 81 * sizeof(int));
-    cudaMalloc(&best_path, parent_cnt_estimate*MAX_LAYER * sizeof(unsigned long long));
+    cudaMalloc(&best_path, parent_cnt_estimate*MAX_LAYER * sizeof(int));
     cudaMalloc(&childCosts, parent_cnt_estimate*MAX_LAYER * sizeof(double));
     cudaMalloc(&childCosts_road, parent_cnt_estimate*MAX_LAYER * sizeof(int));
-    cudaMalloc(&packed_information, parent_cnt_estimate*MAX_LAYER * sizeof(unsigned long long));
+    cudaMalloc(&packed_information, parent_cnt_estimate*MAX_LAYER * sizeof(int));
     cudaMalloc(&currentChildIDX, parent_cnt_estimate * sizeof(int));
     ///////////////////////////////////  cpu arrays init starts  ////////////////////////////////////////
     node_cnt_sum_cpu = new int[net_cnt_estimate]();
@@ -841,10 +1265,36 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
     currentChildIDX_cpu = new int[parent_cnt_estimate]();
     depthID2nodeSequence = new int[batches.size()*MAX_DEPTH];
     ///////////////////////////////////  cpu arrays init ends  ////////////////////////////////////////
+    start_total = std::chrono::high_resolution_clock::now();
+    time1 = time3 = time4 = time5 = time_update_cost = time7 = time8 = time9 = time10 = std::chrono::duration<double>(0);
     // for(int ii = 0; ii < batches.size(); ii++)
     for(int ii = batches.size()-1; ii >=0; ii--)
     {
         Lshape_route_detour(batches[ii]);
+        // if(ii%50==0)
+        // {
+        //     start = std::chrono::high_resolution_clock::now();
+        //     if(LOG) graph::report_score();
+        //     end = std::chrono::high_resolution_clock::now();
+        //     time8 += end - start;
+        // }
+    }
+    end_total = std::chrono::high_resolution_clock::now();
+    time6 = end_total-start_total-time1-time3-time4-time5-time_update_cost-time7-time8-time9-time10;
+    if(LOG)
+    {
+        printf("time total %f\n", (end_total-start_total).count());
+        printf("init_cpu_array time: %f\n", time1.count());
+        printf("mark congestion time: %f\n", time7.count());
+        printf("dfs time: %f\n", time3.count());
+        printf("mem_cpy time: %f\n", time4.count());
+        printf("update cost time: %f\n", time_update_cost.count());
+        printf("DAG forward time: %f\n", time5.count());
+        printf("DAG backward time: %f\n", time9.count());
+        printf("pre_compute_edge_cost time: %f\n", time10.count());
+        printf("log performance time: %f\n", time8.count());
+        printf("others time: %f\n", time6.count());
+        printf("cntCongested = %d, totalEdgeNum = %d\n", cntCongested, totalEdgeNum);
     }
     
 
@@ -853,8 +1303,10 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
     cudaFree(nodes);
     cudaFree(from);
     cudaFree(layer_range);
+    // cudaFree(child_num);
     cudaFree(in_degree);
     cudaFree(currentChildIDX);
+    // cudaFree(par_num);
     cudaFree(par_num_sum);
     cudaFree(locks);
     cudaFree(layer_output);
@@ -893,6 +1345,7 @@ void Lshape_route_detour_wrap(vector<int> &nets2route) {
 
 
 void Lshape_route_detour(vector<int> &nets2route) {
+    // printf("calling Lshape_route_detour\n");
     vector<vector<int>> batches;
     batches.push_back(nets2route);
     vector<int> batch_cnt_sum(batches.size() + 1, 0);
@@ -912,6 +1365,8 @@ void Lshape_route_detour(vector<int> &nets2route) {
         node_cnt += nets[net_id].node_index_cnt;
         par_cnt += nets[net_id].par_num_sum_cpu[nets[net_id].node_index_cnt];
     }
+    start = std::chrono::high_resolution_clock::now();
+    ////////////////////////////////////////////// cpu array memset starts //////////////////////////////////////////////////
     memset(node_cnt_sum_cpu, 0, (net_cnt + 1) * sizeof(int));
     int batch_reserve_node = node_cnt + 10;
     int reserve_node_num = min(node_cnt_estimate, batch_reserve_node);//to be optimized
@@ -923,13 +1378,19 @@ void Lshape_route_detour(vector<int> &nets2route) {
     memset(par_num_cpu, 0, reserve_node_num * sizeof(int));
     memset(par_num_sum_cpu, 0, reserve_node_num * sizeof(int));
     memset(depthID2nodeSequence, 0, batches.size()*MAX_DEPTH * sizeof(int));
+    end = std::chrono::high_resolution_clock::now();
+    time1 += end-start;
     ////////////////////////////////////////////// cpu array memset ends //////////////////////////////////////////////////
+    // this can parallel
     for(int b_id=0; b_id<batches.size(); b_id++)
     for(int j=0; j< batches[b_id].size(); j++){
         int net_idx = batches[b_id][j];
         auto &graph_x = nets[net_idx].rsmt;
         int select_root = nets[net_idx].select_root;
+        // printf("select root = %d\n", select_root);
         int id = batch_cnt_sum[b_id] + j;
+        start = std::chrono::high_resolution_clock::now();
+        // copy net structure
         int net_num_nodes = nets[net_idx].node_index_cnt;
         node_cnt_sum_cpu[id+1] = net_num_nodes;
         for(int n_i= 0; n_i < net_num_nodes; n_i++)
@@ -961,12 +1422,19 @@ void Lshape_route_detour(vector<int> &nets2route) {
                 pid_total++;
             }
         }
+        // for(int pid = 0; pid < par_num_total; pid++)
+        // {
+        //     currentChildIDX_cpu[par_num_sum_cpu[node_start] + pid] = nets[net_idx].currentChildIDX_cpu[pid];
+        //     par_nodes_cpu[par_num_sum_cpu[node_start] + pid] = nets[net_idx].par_nodes_cpu[pid] + node_cnt_sum_cpu[id];
+        // }
+        end = std::chrono::high_resolution_clock::now();
+        time3 += end-start;
         for(int i=node_cnt_sum_cpu[id];i<node_cnt_sum_cpu[id]+node_cnt_sum_cpu[id + 1];i++)
         {
             int depth_node_i = node_depth_cpu[i];
             depth_node_cnt_cpu[b_id*MAX_DEPTH+depth_node_i+1]++;
         }
-        if(false)
+        if(false&&nets2route.size()==1)
         {
             for(int i=node_cnt_sum_cpu[id];i<node_cnt_sum_cpu[id]+node_cnt_sum_cpu[id + 1];i++)
             {
@@ -1030,6 +1498,7 @@ void Lshape_route_detour(vector<int> &nets2route) {
         child_num_sum_cpu[node_id] = child_num_cpu[node_id-1];
         child_num_sum_cpu[node_id] += child_num_sum_cpu[node_id - 1];
     }
+    start = std::chrono::high_resolution_clock::now();
     cudaMemcpy(net_ids, nets2route.data(), net_cnt * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(layer_output, 0xFF, reserve_node_num * sizeof(int));
     cudaMemcpy(node_cnt_sum, node_cnt_sum_cpu, (net_cnt + 1) * sizeof(int), cudaMemcpyHostToDevice);
@@ -1039,92 +1508,127 @@ void Lshape_route_detour(vector<int> &nets2route) {
     cudaMemcpy(child_num_sum, child_num_sum_cpu, (node_cnt_sum_cpu[net_cnt]+1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(par_num_sum, par_num_sum_cpu, (node_total+1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(node_net_idx, node_net_idx_cpu, node_total * sizeof(int), cudaMemcpyHostToDevice);
+    // cudaMemcpy(node_net_idx2, node_net_idx2_cpu, node_total * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(node_depth, node_depth_cpu, node_total * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(depth_node, depth_node_cpu, node_total * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(par_nodes, par_nodes_cpu, par_num_sum_cpu[node_total] * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(currentChildIDX, currentChildIDX_cpu, par_num_sum_cpu[node_total] * sizeof(int), cudaMemcpyHostToDevice);
+    end = std::chrono::high_resolution_clock::now();
+    time4+=end-start;
     // int sequence_end;
-    {
-        cudaDeviceSynchronize();
-        auto t = cudaGetLastError();
-        if (t != cudaSuccess) {
-            fprintf(stderr, "cudaMemcpy Error: %s\n", cudaGetErrorString(t));
-            exit(EXIT_FAILURE);
-        }
-    }
     init_costs<<<node_total, 10>>>(node_total*MAX_LAYER);
     init_min_child_costs<<<(child_num_sum_cpu[node_total]+1) * MAX_LAYER, 1>>>((child_num_sum_cpu[node_total]+1) * MAX_LAYER);
+    // init_cost_with_road = packCostAndNodeId(float_to_ordered_int32(1e22),200000000);
     init_road<<<(child_num_sum_cpu[node_total]+1) * MAX_LAYER, 1>>>((child_num_sum_cpu[node_total]+1) * MAX_LAYER);
-
+    
     for(int i = 0; i < batches.size(); i++) {
         int total_node_num = batch_cnt_sum[i+1] - batch_cnt_sum[i];
         int net_offset = batch_cnt_sum[i];
         int next_net_offset = batch_cnt_sum[i+1];
-        graph::commit_wire_demand<<<BLOCK_NUM(batches[i].size()), THREAD_NUM>>> (batches[i].size(), 0, ++global_timestamp, -1, 0);
-        graph::commit_via_demand<<<BLOCK_NUM(batches[i].size()), THREAD_NUM>>> (batches[i].size(), 0, global_timestamp, -1, 0);     
+
+        start = std::chrono::high_resolution_clock::now();
+        graph::commit_wire_demand<<<BLOCK_NUM(batches[i].size()), THREAD_NUM>>> (batches[i].size(), 0, ++global_timestamp, -1);
+        graph::commit_via_demand<<<BLOCK_NUM(batches[i].size()), THREAD_NUM>>> (batches[i].size(), 0, global_timestamp, -1);     
         global_timestamp++;
         graph::update_cost();
-        {
-            cudaDeviceSynchronize();
-            auto t = cudaGetLastError();
-            if (t != cudaSuccess) {
-                fprintf(stderr, "update_cost CUDA Error: %s\n", cudaGetErrorString(t));
-                exit(EXIT_FAILURE);
-            }
-        }
+        // printf("after ripup\n");
+        // if(LOG) graph::report_score();
         graph::compute_presum<<<all_track_cnt, THREAD_NUM, sizeof(double) * XY>>> ();
-        {
-            cudaDeviceSynchronize();
-            auto t = cudaGetLastError();
-            if (t != cudaSuccess) {
-                fprintf(stderr, "compute_presum Error: %s\n", cudaGetErrorString(t));
-                exit(EXIT_FAILURE);
-            }
-        }
+        cudaDeviceSynchronize();
+        end = std::chrono::high_resolution_clock::now();
+        time_update_cost+=end-start;
 
         int cur_batch_depth = batch_depth_cnt_cpu[i+1] - batch_depth_cnt_cpu[i];
-        precompute_cost_edge<<<BLOCK_NUM(par_num_sum_cpu[node_total] * 9), THREAD_NUM>>>(par_num_sum_cpu[node_total]);
+        start = std::chrono::high_resolution_clock::now();
+        // precompute_cost_edge<<<BLOCK_NUM(par_num_sum_cpu[node_total] * 9), THREAD_NUM>>>(par_num_sum_cpu[node_total]);
         {
             cudaDeviceSynchronize();
             auto t = cudaGetLastError();
             if (t != cudaSuccess) {
-                fprintf(stderr, "precompute_cost_edge Error: %s\n", cudaGetErrorString(t));
-                exit(EXIT_FAILURE);
+                fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(t));
+                // Optional: Handle error, e.g., cleanup resources
+                exit(EXIT_FAILURE);  // Use exit to terminate the program gracefully
             }
         }
+        end = std::chrono::high_resolution_clock::now();
+        time10+=end-start;
+        start = std::chrono::high_resolution_clock::now();
         for(int d = cur_batch_depth - 1; d >= 0; d--)
         {
             int shift = depthID2nodeSequence[batch_depth_cnt_cpu[i]+d];
             int end_shift = depthID2nodeSequence[batch_depth_cnt_cpu[i]+d+1];
-            // Lshape_route_node_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift);
-            Lshape_route_node_layer_change_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift);
+            // printf("batch %d, depth %d, updating from %d to %d\n", i, d, shift, end_shift);
+            // for(int iii=shift; iii<end_shift; iii++)
+            // {
+            //     int node_idx = depth_node_cpu[iii];
+            //     // printf("updating node %d, correspond to net %d\n", node_idx, node_net_idx_cpu[node_idx]);
+            //     Lshape_route_node_cuda<<<BLOCK_NUM(1), 1>>> (iii, iii+1);
+            //     {
+            //         cudaDeviceSynchronize();
+            //         auto t = cudaGetLastError();
+            //         if(t != 0) {
+            //             printf("failed at %d\n", iii);
+            //             printf("cuda error %d\n", t);
+            //             assert(0);
+            //             exit(0);
+            //         }
+            //     }
+            // }
+            Lshape_route_node_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift);
+            // Lshape_route_node_layer_change_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift);
             {
                 cudaDeviceSynchronize();
                 auto t = cudaGetLastError();
                 if(t != 0) {
-                    fprintf(stderr, "L shape route CUDA error %d\n", t);
+                    printf("cuda error %d\n", t);
+                    // assert(0);
                     exit(0);
                 }
             }
         }
+        // printf("after phase1\n");
+        // if(LOG) graph::report_score();
+        end = std::chrono::high_resolution_clock::now();
+        time5+=end-start;
+        start = std::chrono::high_resolution_clock::now();
         for(int d = 0; d < cur_batch_depth; d++)
         {
             int shift = depthID2nodeSequence[batch_depth_cnt_cpu[i]+d];
             int end_shift = depthID2nodeSequence[batch_depth_cnt_cpu[i]+d+1];
-            // get_routing_tree_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift, d, global_timestamp);
-            get_routing_tree_layer_change_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift, d, global_timestamp);
+            // printf("batch %d, depth %d, updating from %d to %d\n", i, d, shift, end_shift);
+            // for(int iii=shift; iii<end_shift; iii++)
+            // {
+            //     get_routing_tree_cuda<<<BLOCK_NUM(100), 100>>> (iii, iii+1, d);
+            //     {
+            //         cudaDeviceSynchronize();
+            //         auto t = cudaGetLastError();
+            //         if(t != 0) {
+            //             int node_id = depth_node_cpu[iii];
+            //             int net_id = node_net_idx_cpu[node_id];
+            //             printf("iii=%d, node_id = %d, net_idx = %d\n", iii, node_id, net_id);
+            //             printf("cuda error %d\n", t);
+            //             exit(0);
+            //         }
+            //     }
+            // }
+            get_routing_tree_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift, d, global_timestamp);
+            // get_routing_tree_layer_change_cuda<<<BLOCK_NUM(end_shift-shift+1), 512>>> (shift, end_shift, d, global_timestamp);
             {
                 cudaDeviceSynchronize();
                 auto t = cudaGetLastError();
                 if(t != 0) {
-                    fprintf(stderr, "get routing tree CUDA error %d\n", t);
+                    printf("cuda error %d\n", t);
+                    assert(0);
                     exit(0);
                 }
             }
         }
+        end = std::chrono::high_resolution_clock::now();
+        time9+=end-start;
         graph::batch_wire_update(global_timestamp);
         graph::commit_via_demand<<<BLOCK_NUM(batches[i].size()), THREAD_NUM>>> (batches[i].size(), 0, global_timestamp);
     }
+
 }
 
 }
