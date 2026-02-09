@@ -4,6 +4,8 @@ InstantGR is a GPU-accelerated global routing tool.
 
 Check out the following paper for more details.
 
+* Liang Xiao, Shiju Lin, Jinwei Liu, Qinkai Duan, Tsung-Yi Ho, and Evangeline Young, ["InstantGR: Scalable GPU Parallelization for 3-D Global Routing"](https://ieeexplore.ieee.org/document/11015529), IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems (TCAD), 2025
+
 * Shiju Lin, Liang Xiao, Jinwei Liu and Evangeline Young, ["InstantGR: Scalable GPU Parallelization for Global Routing"](https://shijulin.github.io/files/1239_Final_Manuscript.pdf), ACM/IEEE International Conference on Computer-Aided Design (ICCAD), New Jersey, USA, Oct 27–31, 2024.
 
 ## Compile
